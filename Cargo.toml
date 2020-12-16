@@ -1,0 +1,25 @@
+[package]
+name = "ioplayground"
+version = "0.1.0"
+authors = ["Ben <ben.bromhead@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.2.20", features = ["full", "macros"] }
+tokio-util = { version = "0.3.1", features = ["codec"]}
+bytes = "0.5.*"
+redis-protocol = { git = "https://github.com/benbromhead/redis-protocol.rs", branch = "vecsupport" }
+cassandra-proto = { git = "https://github.com/benbromhead/cassandra-proto", branch = "move-to-bytes", features = ["v4"]}
+anyhow = "1.0.31"
+tracing = { version = "0.1.15", features = ["max_level_trace"]}
+itertools = "0.9.0"
+futures = "0.3.5"
+futures-core = "0.3.1"
+memchr = "2.3.0"
+
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
