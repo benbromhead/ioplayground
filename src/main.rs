@@ -1,21 +1,31 @@
 use tokio::runtime;
 use tokio::net::{TcpListener, TcpStream};
 use ioplayground::protocols::redis1::RedisCodec;
-use tokio_util::codec::{Framed, FramedWrite, FramedRead};
-use futures::{FutureExt, SinkExt, StreamExt};
+use tokio_util::codec::{Framed};
+use futures::{SinkExt, StreamExt};
 use anyhow::Result;
 use tokio::signal;
-use redis_protocol::types::Frame;
-use ioplayground::protocols::redis2::{RespParser, RedisValueRef};
+use glommio::LocalExecutorBuilder;
+use futures::{AsyncRead, AsyncWrite};
+use std::io;
+use std::pin::Pin;
+use futures::io::Error;
+use futures::task::{Context, Poll};
+use glommio::Task;
+use clap::Clap;
+
+use tokio::prelude::{AsyncRead as TAsyncRead, AsyncWrite as TAsyncWrite};
+
 
 //1 core == 264k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e) - redis1 codec
 //4 core == 500k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e) - redis1 codec Redis CPU maxed!
 //1 core == 83k (./src/redis-benchmark -n 100000000 -t get -P 1 -r 10000 -e) - No pipelined
-async fn async_basic() -> Result<()> {
+async fn async_basic(upstream_connection_string: String) -> Result<()> {
     let mut listener = TcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
 
     loop {
         let codec = RedisCodec::new(false, 1);
+        let upstream_connection_string= upstream_connection_string.clone();
         let socket = tokio::select! {
              s = listener.accept() => {
                 s?.0
@@ -28,7 +38,7 @@ async fn async_basic() -> Result<()> {
         };
         let mut connection = Framed::new(socket, codec.clone());
         tokio::spawn(async move {
-            let outbound_stream = TcpStream::connect("172.20.0.2:6379".to_string()).await.unwrap();
+            let outbound_stream = TcpStream::connect(upstream_connection_string.clone()).await.unwrap();
             let codec = RedisCodec::new(true, 1);
             let mut outbound_connection = Framed::new(outbound_stream, codec);
 
@@ -43,207 +53,135 @@ async fn async_basic() -> Result<()> {
 }
 
 
-//1 core == 257k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e)
-//4 core == 520k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e) - Redis CPU maxed!
-async fn async_mpsc() -> Result<()> {
-    let mut listener = TcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
+#[derive(Debug)]
+pub struct TokioGlomStream {
+    pub stream: glommio::net::TcpStream,
+}
+
+impl AsyncWrite for TokioGlomStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        // Pin::new(self.).stream.poll_write(cx, buf)
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.stream).poll_close(cx)
+    }
+}
+
+impl AsyncRead for TokioGlomStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Error>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl TAsyncRead for TokioGlomStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl TAsyncWrite for TokioGlomStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.stream).poll_close(cx)
+    }
+}
+
+async fn async_basic_glommio(upstream_connection_string: String) -> Result<()> {
+    let listener = glommio::net::TcpListener::bind("127.0.0.1:6379".to_string()).unwrap();
+    // let mut listener = glommioTcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
 
     loop {
         let codec = RedisCodec::new(false, 1);
-        let socket = tokio::select! {
-             s = listener.accept() => {
-                s?.0
-            },
-            _ = signal::ctrl_c() => {
-                    // If a shutdown signal is received, return from `run`.
-                    // This will result in the task terminating.
-                    return Ok(());
-                }
-        };
-        let mut connection = Framed::new(socket, codec.clone());
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Frame>>();
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Frame>>();
+        let upstream_connection_string= upstream_connection_string.clone();
 
-        tokio::spawn(async move {
+        let socket = listener.accept().await?;
+        let mut connection = Framed::new(TokioGlomStream { stream: socket }, codec.clone());
+
+        Task::local(async move {
+            let outbound_stream = glommio::net::TcpStream::connect(upstream_connection_string).await.unwrap();
+            let codec = RedisCodec::new(true, 1);
+            let mut outbound_connection = Framed::new(TokioGlomStream { stream:outbound_stream}, codec);
+
             while let Some(Ok(frame)) = connection.next().await {
-                out_tx.send(frame).unwrap();
-                if let Some(frame) = in_rx.recv().await {
+                outbound_connection.send(frame).await.unwrap();
+                if let Some(Ok(frame)) = outbound_connection.next().await {
                     connection.send(frame).await.unwrap()
                 }
             }
-        });
-
-
-        tokio::spawn(async move {
-            let outbound_stream = TcpStream::connect("172.20.0.2:6379".to_string()).await.unwrap();
-            let codec = RedisCodec::new(true, 1);
-            let mut outbound_connection = Framed::new(outbound_stream, codec);
-
-            while let Some(frame) = out_rx.recv().await {
-                outbound_connection.send(frame).await.unwrap();
-                if let Some(Ok(frame)) = outbound_connection.next().await {
-                    in_tx.send(frame).unwrap();
-                }
-            }
-        });
+        }).detach();
     }
 }
 
 
-//1 core == 238k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e)
-async fn async_mpsc_select() -> Result<()> {
-    let mut listener = TcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
+#[derive(Clap)]
+#[clap(version = "0.0.1", author = "Ben")]
+struct ConfigOpts {
+    #[clap(short, long, default_value = "tokio")]
+    pub executor: String,
 
-    loop {
-        let codec = RedisCodec::new(false, 1);
-        let socket = tokio::select! {
-             s = listener.accept() => {
-                s?.0
-            },
-            _ = signal::ctrl_c() => {
-                    // If a shutdown signal is received, return from `run`.
-                    // This will result in the task terminating.
-                    return Ok(());
-                }
-        };
-        let mut connection = Framed::new(socket, codec.clone());
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Frame>>();
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Frame>>();
+    #[clap(short, long, default_value = "1")]
+    pub cores: usize,
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(Ok(frame)) = connection.next() => {
-                        out_tx.send(frame).unwrap();
-                    },
-                    Some(frame) = in_rx.recv() => {
-                        connection.send(frame).await.unwrap()
-                    },
-                    else => break,
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            let outbound_stream = TcpStream::connect("172.20.0.2:6379".to_string()).await.unwrap();
-            let codec = RedisCodec::new(true, 1);
-            let mut outbound_connection = Framed::new(outbound_stream, codec);
-
-            loop {
-                tokio::select! {
-                    Some(Ok(frame)) = outbound_connection.next() => {
-                        in_tx.send(frame).unwrap();
-                    },
-                    Some(frame) = out_rx.recv() => {
-                        outbound_connection.send(frame).await.unwrap()
-                    },
-                    else => break,
-                }
-            }
-        });
-    }
+    #[clap(short, long)]
+    pub upstream: String,
 }
-
-
-//1 core == 152k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e)
-//1 core == 82k (./src/redis-benchmark -n 100000000 -t get -P 1 -r 10000 -e) - No pipelined
-async fn async_mpsc_select_redis2() -> Result<()> {
-    let mut listener = TcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
-
-    loop {
-        let socket = tokio::select! {
-             s = listener.accept() => {
-                s?.0
-            },
-            _ = signal::ctrl_c() => {
-                    // If a shutdown signal is received, return from `run`.
-                    // This will result in the task terminating.
-                    return Ok(());
-                }
-        };
-        let mut connection = Framed::new(socket, RespParser::default());
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<RedisValueRef>();
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<RedisValueRef>();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(Ok(frame)) = connection.next() => {
-                        out_tx.send(frame).unwrap();
-                    },
-                    Some(frame) = in_rx.recv() => {
-                        connection.send(frame).await.unwrap()
-                    },
-                    else => break,
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            let outbound_stream = TcpStream::connect("172.20.0.2:6379".to_string()).await.unwrap();
-            let codec = RespParser::default();
-            let mut outbound_connection = Framed::new(outbound_stream, codec);
-
-            loop {
-                tokio::select! {
-                    Some(Ok(frame)) = outbound_connection.next() => {
-                        in_tx.send(frame).unwrap();
-                    },
-                    Some(frame) = out_rx.recv() => {
-                        outbound_connection.send(frame).await.unwrap()
-                    },
-                    else => break,
-                }
-            }
-        });
-    }
-}
-
-//1 core == 259k ~ 260k (./src/redis-benchmark -n 100000000 -t get -P 4 -r 10000 -e)
-async fn async_main() -> Result<()> {
-    let mut listener = TcpListener::bind("127.0.0.1:6379".to_string()).await.unwrap();
-
-    loop {
-        let codec = RedisCodec::new(false, 1);
-        let socket: TcpStream = tokio::select! {
-             s = listener.accept() => {
-                s?.0
-            },
-            _ = signal::ctrl_c() => {
-                    // If a shutdown signal is received, return from `run`.
-                    // This will result in the task terminating.
-                    return Ok(());
-                }
-        };
-        let split = socket.into_split();
-        // let mut connection = Framed::new(socket, codec.clone());
-        tokio::spawn(async move {
-            let (in_w, in_r) = (FramedWrite::new(split.1, codec.clone()), FramedRead::new(split.0, codec.clone()));
-            let mut temp = TcpStream::connect("172.20.0.2:6379".to_string()).await.unwrap();
-            let outbound_stream = temp.split();
-            let codec = RedisCodec::new(true, 1);
-            let (out_w, out_r) = (FramedWrite::new(outbound_stream.1, codec.clone()), FramedRead::new(outbound_stream.0, codec.clone()));
-
-            let _ = tokio::join!(
-               in_r.forward(out_w),
-               out_r.forward(in_w)
-            );
-        });
-    }
-}
-
 
 
 fn main() {
-    let mut rt = runtime::Builder::new()
-        .enable_all()
-        .thread_name("RPProxy-Thread")
-        .threaded_scheduler()
-        .core_threads(1)
-        .build()
-        .unwrap();
+    let params = ConfigOpts::parse();
 
-    rt.block_on(async_basic());
+    let tokio = params.executor == "tokio".to_string();
 
-    println!("Hello, world!");
+    if tokio {
+        println!("Starting Tokio!");
+        let mut rt = runtime::Builder::new()
+            .enable_all()
+            .thread_name("RPProxy-Thread")
+            .threaded_scheduler()
+            .core_threads(params.cores)
+            .build()
+            .unwrap();
+        rt.block_on(async_basic(params.upstream)).unwrap();
+
+    } else {
+        println!("Starting Glommio!");
+        LocalExecutorBuilder::new()
+            .pin_to_cpu(params.cores)
+            .spawn(|| async move {
+                async_basic_glommio(params.upstream).await
+            })
+            .unwrap()
+            .join().unwrap();
+    }
+
+    println!("Done!");
 }
